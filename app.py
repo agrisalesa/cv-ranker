@@ -104,10 +104,21 @@ def approx_tokens(text: str) -> int:
 # UI — Sidebar
 # ==========================
 st.sidebar.title("⚙️ Configuración")
-api_key_input = st.sidebar.text_input(
-    "OpenAI API Key", value=OPENAI_API_KEY or "", type="password",
-    help="No se guarda en el servidor."
-)
+
+# Usar clave de secrets o variable de entorno si existe
+api_key_input = OPENAI_API_KEY
+
+if not api_key_input:
+    # Solo mostrar input si no hay key en secrets/env
+    api_key_input = st.sidebar.text_input(
+        "OpenAI API Key",
+        value="",
+        type="password",
+        help="No se guarda en el servidor."
+    )
+else:
+    st.sidebar.success("🔑 API Key cargada desde configuración segura.")
+
 
 MODEL_CHAT = st.sidebar.selectbox(
     "Modelo de Chat",
