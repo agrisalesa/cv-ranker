@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Evaluador de CVs — Perfiles para un Cargo (con capa visual)
------------------------------------------------------------
+Evaluador de CVs — Perfiles para un Cargo (con capa visual + logs CSV)
+----------------------------------------------------------------------
 • Sube hasta 10 hojas de vida en PDF
 • Escribe el cargo y las skills requeridas
 • Obtén una tabla con: nombre, resumen corto, skills detectadas, veredicto (5 niveles), veredicto detallado y calificación 0–100
-• Diagnóstico opcional de calidad del CV: estructura, redacción, calidad de experiencia y observaciones
+• Diagnóstico opcional: estructura, redacción, calidad de experiencia y observaciones
 • Descarga en Excel (fallback a CSV si no hay openpyxl)
-• Capa visual: colores por veredicto + barra de progreso en calificación
+• Capa visual: colores por veredicto + barra de avance en calificación
+• Logs en CSV (MVP): logs/events.csv + descarga para admin
 
-*La configuración sensible (clave) se toma de Secrets/entorno. La interfaz no muestra controles técnicos al usuario final.*
+La configuración sensible (clave) se toma de Secrets/entorno. La interfaz no muestra controles técnicos al usuario final.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import os
 import re
 import json
 import base64
+import csv, uuid, time, datetime as dt
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -40,7 +42,7 @@ load_dotenv()
 st.set_page_config(page_title="Evaluador de CVs — Perfiles para un Cargo", page_icon="📄", layout="wide")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CHAT_MODEL_DEFAULT = "gpt-5"  # puedes cambiarlo en secrets con SHOW_ADMIN=true
+CHAT_MODEL_DEFAULT = "gpt-5"   # puedes cambiarlo con SHOW_ADMIN=true en Secrets
 MAX_PDFS_FREE = 10
 SHOW_ADMIN = str(st.secrets.get("SHOW_ADMIN", "false")).lower() == "true"
 
@@ -51,9 +53,36 @@ if "busy" not in st.session_state:
     st.session_state["busy"] = False
 if "evaluaciones" not in st.session_state:
     st.session_state["evaluaciones"] = None
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())
 
 def set_busy(flag: bool):
     st.session_state["busy"] = flag
+
+# ==========================
+# LOGS CSV (MVP)
+# ==========================
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "events.csv")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+def log_event(event: str, payload: dict | None = None):
+    """Escribe un evento en CSV sin romper la app si falla."""
+    try:
+        is_new = not os.path.exists(LOG_FILE)
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["ts_iso", "session_id", "event", "payload_json"])
+            w.writerow([
+                dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                st.session_state["session_id"],
+                event,
+                json.dumps(payload or {}, ensure_ascii=False)
+            ])
+    except Exception:
+        # No detener la app por fallos de log
+        pass
 
 # ==========================
 # Utilidades
@@ -69,6 +98,7 @@ def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or " ").strip()
 
 def windows_around_skills(text: str, skills: List[str], radius: int = 220, max_windows: int = 8) -> str:
+    """Recorta el CV a ventanas alrededor de cada skill (reduce tokens y acelera)."""
     windows = []
     for s in skills:
         for m in re.finditer(rf"(.{{0,{radius}}}\b{s}\b.{{0,{radius}}})", text, flags=re.IGNORECASE):
@@ -131,7 +161,7 @@ def barra_calificacion(val: Any) -> str:
     except Exception:
         v = 0
     v = max(0, min(100, v))
-    # Color por umbrales
+    # Color por umbrales (alineado a rangos de veredicto)
     color = "#2e7d32" if v >= 80 else "#43a047" if v >= 61 else "#ffb300" if v >= 41 else "#fb8c00" if v >= 21 else "#e53935"
     return f"""
     <div style="width:110px; background:#e5e7eb; border-radius:6px; overflow:hidden;">
@@ -145,7 +175,6 @@ def badges_skills(val: Any) -> str:
     if isinstance(val, list):
         skills = val
     elif isinstance(val, str):
-        # por si llega como string de lista
         skills = [s.strip() for s in re.split(r"[,\|·]", val) if s.strip()]
     else:
         skills = []
@@ -166,7 +195,7 @@ def style_table(df: pd.DataFrame, columns_order: List[str]) -> str:
     return sty.to_html(escape=False)
 
 # ==========================
-# Panel lateral (solo info)
+# Panel lateral (solo info al usuario)
 # ==========================
 st.sidebar.title("Configuración")
 if OPENAI_API_KEY:
@@ -195,7 +224,7 @@ col_left, col_right = st.columns([1, 1])
 with col_left:
     cargo = st.text_area(
         "Cargo / Descripción del puesto",
-        placeholder="Ejemplo: Cargo: Científico de Datos (Colombia).Buscamos un Científico de Datos con al menos 4 años de experiencia en el desarrollo..",
+        placeholder="Ejemplo: Científico/a de Datos Senior. Python, SQL, Machine Learning, arquitectura de datos, MLOps…",
         height=130,
         disabled=st.session_state["busy"]
     )
@@ -217,10 +246,20 @@ if files and len(files) > MAX_PDFS_FREE:
     st.warning(f"Solo se permiten {MAX_PDFS_FREE} PDFs por sesión. Tomaré los primeros {MAX_PDFS_FREE}.")
     files = files[:MAX_PDFS_FREE]
 
+# Log: selección de archivos
+if files is not None:
+    try:
+        log_event("files_selected", {
+            "num_files": len(files),
+            "filenames": [f.name for f in files]
+        })
+    except Exception:
+        pass
+
 run = st.button("Evaluar y generar tabla", disabled=st.session_state["busy"])
 
 # ==========================
-# Prompt + Evaluación
+# Prompt + Evaluación (incluye diagnóstico)
 # ==========================
 def build_prompt(name: str, cargo: str, skills: List[str], context: str) -> str:
     return f"""
@@ -252,6 +291,7 @@ Criterios (rango → etiqueta):
 """
 
 def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: List[str]) -> Dict[str, Any]:
+    # Modo rápido: recorte base + ventanas alrededor de skills
     base = text[:2500]
     skill_windows = windows_around_skills(text, skills, radius=220, max_windows=8)
     context = (base + "\n\n" + skill_windows).strip()[:7000]
@@ -270,7 +310,7 @@ def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: L
         content = f'{{"nombre":"{name}","resumen_corto":"No fue posible evaluar el CV","skills_detectadas":[],"veredicto":"Muy Débil","veredicto_detallado":"Error de evaluación","calificacion":0,"estructura":"","redaccion":"","calidad_experiencia":"","observaciones":"","_error":"{e}"}}'
 
     data = safe_json_from_text(content)
-    # Defaults
+    # Defaults / normalización
     data.setdefault("nombre", name)
     data.setdefault("resumen_corto", "")
     data.setdefault("skills_detectadas", [])
@@ -303,6 +343,14 @@ if run:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
     set_busy(True)
+
+    # Log: inicio de evaluación
+    t0 = time.time()
+    log_event("evaluation_started", {
+        "num_files": len(files) if files else 0,
+        "skills_count": len(skills),
+        "cargo_chars": len(cargo or "")
+    })
 
     with st.status("Procesando CVs…", expanded=True) as status:
         status.write("Extrayendo texto…")
@@ -339,6 +387,19 @@ if run:
         "estructura", "redaccion", "calidad_experiencia", "observaciones"
     ]).sort_values("calificacion", ascending=False).reset_index(drop=True)
     st.session_state["evaluaciones"] = df
+
+    # Log: fin de evaluación
+    elapsed = round(time.time() - t0, 2)
+    try:
+        top_score = int(df["calificacion"].max()) if len(df) else None
+    except Exception:
+        top_score = None
+    log_event("evaluation_finished", {
+        "elapsed_sec": elapsed,
+        "num_rows": int(len(df)),
+        "top_score": top_score
+    })
+
     set_busy(False)
 
 # ==========================
@@ -362,14 +423,36 @@ if st.session_state["evaluaciones"] is not None:
     html_table = style_table(df, cols)
     st.write(html_table, unsafe_allow_html=True)
 
-    # Descarga (Excel preferido)
+    # Descarga (Excel preferido, CSV fallback) + log descarga
     xlsx = df_to_excel_bytes(df, sheet_name="Resultados")
     if xlsx is not None:
         st.markdown(b64_download_link(xlsx, "ranking_perfiles.xlsx", "⬇️ Descargar Excel"), unsafe_allow_html=True)
+        log_event("download_results", {"format": "xlsx"})
     else:
         st.info("Descargando CSV.")
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         st.markdown(b64_download_link(csv_bytes, "ranking_perfiles.csv", "⬇️ Descargar CSV"), unsafe_allow_html=True)
+        log_event("download_results", {"format": "csv"})
+
+# ==========================
+# Bloque Admin: descarga de logs
+# ==========================
+if SHOW_ADMIN:
+    st.markdown("---")
+    st.subheader("Logs de uso (solo administrador)")
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "rb") as f:
+                st.download_button(
+                    label="⬇️ Descargar logs (CSV)",
+                    data=f.read(),
+                    file_name="events.csv",
+                    mime="text/csv"
+                )
+        except Exception:
+            st.caption("No se pudo leer el archivo de logs.")
+    else:
+        st.caption("Aún no hay logs registrados.")
 
 # ==========================
 # Pie de página (contacto)
@@ -385,4 +468,5 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
 
