@@ -1,11 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Rankeador de CVs — LLM Scoring (rápido, 5 niveles de veredicto, sin exponer secrets)
-- Subes hasta 10 PDFs
-- El LLM evalúa y devuelve JSON por CV
-- Tabla final + descarga Excel (fallback CSV)
-- Paraleliza evaluaciones y reduce tokens (modo rápido)
+Evaluador de CVs — Perfiles para un Cargo
+-----------------------------------------
+• Sube hasta 10 hojas de vida en PDF
+• Escribe el cargo y las skills requeridas
+• Obtén una tabla con: nombre, resumen corto, skills detectadas, veredicto (5 niveles) y calificación 0–100
+• Descarga el resultado en Excel (si no está disponible, se ofrece CSV)
+
+Nota: la configuración (clave de API y opciones internas) se maneja de forma segura vía Secrets/entorno.
+No se muestran controles técnicos en la interfaz pública.
 """
 from __future__ import annotations
 
@@ -22,27 +26,26 @@ import streamlit as st
 import pdfplumber
 from dotenv import load_dotenv
 
-# OpenAI SDK
+# SDK OpenAI
 try:
     from openai import OpenAI
 except Exception:
     raise RuntimeError("Falta el paquete 'openai'. Instala: pip install openai")
 
 # ==========================
-# Configuración base
+# Configuración base (no visible para usuarios)
 # ==========================
 load_dotenv()
-st.set_page_config(page_title="📊 Rankeador de CVs — LLM Fast", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Evaluador de CVs — Perfiles para un Cargo", page_icon="📄", layout="wide")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CHAT_MODEL_DEFAULT = "gpt-5"            # puedes cambiar a gpt-5-mini / gpt-5-nano en modo admin
+# Modelo por defecto (puedes cambiarlo en secrets usando SHOW_ADMIN, no visible a usuarios)
+CHAT_MODEL_DEFAULT = "gpt-5"
 MAX_PDFS_FREE = 10
-
-# Admin panel visible solo si lo habilitas en Secrets
 SHOW_ADMIN = str(st.secrets.get("SHOW_ADMIN", "false")).lower() == "true"
 
 # ==========================
-# Estado global (UX)
+# Estado global
 # ==========================
 if "busy" not in st.session_state:
     st.session_state["busy"] = False
@@ -53,7 +56,7 @@ def set_busy(flag: bool):
     st.session_state["busy"] = flag
 
 # ==========================
-# Helpers
+# Utilidades
 # ==========================
 def read_pdf_text(file) -> str:
     parts: List[str] = []
@@ -91,7 +94,6 @@ def safe_json_from_text(txt: str) -> Dict[str, Any]:
     m2 = re.search(r"(\{.*\})", txt, flags=re.DOTALL)
     if m2:
         candidate = m2.group(1)
-        # intenta recortar hasta que parsee
         for cut in range(len(candidate), max(len(candidate) - 4000, 100), -50):
             try:
                 return json.loads(candidate[:cut])
@@ -119,68 +121,59 @@ def b64_download_link(data: bytes, filename: str, label: str, mime: str = "appli
     return href
 
 # ==========================
-# Sidebar (oculto para usuarios)
+# Panel lateral (solo mensajes informativos para usuarios)
 # ==========================
-st.sidebar.title("⚙️ Configuración")
-
-# API Key: oculta siempre que exista en secrets/env
-api_key_input = OPENAI_API_KEY
-if not api_key_input:
-    if SHOW_ADMIN:
-        api_key_input = st.sidebar.text_input("OpenAI API Key", value="", type="password")
-    else:
-        st.sidebar.error("Configura OPENAI_API_KEY en Secrets.")
+st.sidebar.title("Configuración")
+if OPENAI_API_KEY:
+    st.sidebar.success("Clave configurada de forma segura.")
 else:
-    st.sidebar.success("🔑 API Key cargada.")
+    st.sidebar.error("Falta la clave segura para procesar CVs. (Configurar en Secrets).")
 
-# Modelo visible solo en admin
+# Controles de administración (solo tú los ves si SHOW_ADMIN=true en Secrets)
 if SHOW_ADMIN:
     CHAT_MODEL = st.sidebar.selectbox(
-        "Modelo de Chat",
+        "Modelo interno (solo administrador)",
         options=["gpt-5", "gpt-5-mini", "gpt-5-nano"],
         index=0,
-        help="Solo visible para admin.",
+        help="Visible solo para el administrador.",
         disabled=st.session_state["busy"]
     )
 else:
     CHAT_MODEL = CHAT_MODEL_DEFAULT
 
-# Modo rápido (fijo ON para usuarios)
-FAST_MODE = True
-st.sidebar.caption(f"Modelo: {CHAT_MODEL} • Modo rápido: {'ON' if FAST_MODE else 'OFF'}")
-
 # ==========================
-# Main UI
+# Interfaz principal (no técnica)
 # ==========================
-st.title("📊 Rankeador de CVs — LLM scoring (rápido, 5 niveles)")
-st.caption("El LLM evalúa y puntúa. Salida: nombre, resumen corto, skills, veredicto (5 niveles), veredicto_detallado, calificación 0–100.")
+st.title("📄 Evaluador de CVs — Perfiles para un Cargo")
+st.caption("Sube hojas de vida en PDF, define el cargo y recibe un ranking con análisis por perfil.")
 
 col_left, col_right = st.columns([1, 1])
 with col_left:
     cargo = st.text_area(
         "Cargo / Descripción del puesto",
-        placeholder="Científico/a de Datos Senior en Colombia. Python, SQL, Machine Learning, arquitectura de datos, MLOps…",
+        placeholder="Ejemplo: Científico/a de Datos Senior. Python, SQL, Machine Learning, arquitectura de datos, MLOps…",
         height=130,
         disabled=st.session_state["busy"]
     )
 with col_right:
     skills_raw = st.text_input(
-        "Skills requeridos (coma separada)",
+        "Skills requeridas (separadas por comas)",
         value="Python, SQL, Machine Learning",
         disabled=st.session_state["busy"]
     )
     skills = [s.strip() for s in skills_raw.split(",") if s.strip()]
 
 files = st.file_uploader(
-    "Sube CVs en PDF (hasta 10)",
-    type=["pdf"], accept_multiple_files=True,
+    "📄 Sube CVs en formato PDF (máximo 10 archivos)",
+    type=["pdf"],  # restricción a PDFs
+    accept_multiple_files=True,
     disabled=st.session_state["busy"]
 )
 if files and len(files) > MAX_PDFS_FREE:
     st.warning(f"Solo se permiten {MAX_PDFS_FREE} PDFs por sesión. Tomaré los primeros {MAX_PDFS_FREE}.")
     files = files[:MAX_PDFS_FREE]
 
-run = st.button("🧠 Evaluar y generar tabla", disabled=st.session_state["busy"])
+run = st.button("Evaluar y generar tabla", disabled=st.session_state["busy"])
 
 # ==========================
 # Prompt y evaluación
@@ -206,7 +199,7 @@ Devuelve SOLO un JSON con esta forma EXACTA (sin texto adicional):
   "veredicto_detallado": "frase clara: ¿sirve para el puesto? ¿qué riesgos/gaps hay?",
   "calificacion": 0-100
 }}
-Criterios de evaluación (usa estos rangos y etiquetas EXACTAS):
+Criterios de evaluación (rango de calificación → etiqueta):
 - Excelente (80–100): candidato ideal, cumple casi todo.
 - Muy Bueno (61–80): buen ajuste, con algunos gaps.
 - Regular (41–60): encaje parcial, riesgos importantes.
@@ -215,24 +208,24 @@ Criterios de evaluación (usa estos rangos y etiquetas EXACTAS):
 """
 
 def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: List[str]) -> Dict[str, Any]:
-    # Contexto rápido: base recortada + ventanas alrededor de skills
+    # Modo rápido: recorte base + ventanas alrededor de skills
     base = text[:2500]
     skill_windows = windows_around_skills(text, skills, radius=220, max_windows=8)
-    context = (base + "\n\n" + skill_windows).strip()[:7000] if FAST_MODE else text[:12000]
+    context = (base + "\n\n" + skill_windows).strip()[:7000]
 
     prompt = build_prompt(name, cargo, skills, context)
     try:
         resp = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": "Eres un reclutador técnico conciso, objetivo y estricto con el formato JSON."},
+                {"role": "system", "content": "Responde únicamente con JSON válido. Sé conciso y objetivo."},
                 {"role": "user", "content": prompt},
             ]
-            # sin temperature/top_p: la familia gpt-5 no soporta otros valores
+            # sin temperature/top_p
         )
         content = resp.choices[0].message.content or ""
     except Exception as e:
-        content = f'{{"nombre":"{name}","resumen_corto":"Error al invocar el modelo","skills_detectadas":[],"veredicto":"Muy Débil","veredicto_detallado":"No se pudo evaluar","calificacion":0,"_error":"{e}"}}'
+        content = f'{{"nombre":"{name}","resumen_corto":"No fue posible evaluar el CV","skills_detectadas":[],"veredicto":"Muy Débil","veredicto_detallado":"Error de evaluación","calificacion":0,"_error":"{e}"}}'
 
     data = safe_json_from_text(content)
     # Defaults / normalización
@@ -252,8 +245,8 @@ def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: L
 # Ejecución
 # ==========================
 if run:
-    if not api_key_input:
-        st.error("Falta OPENAI_API_KEY. Configura el secreto en Streamlit Cloud.")
+    if not OPENAI_API_KEY:
+        st.error("No hay una clave segura configurada para procesar CVs.")
         st.stop()
     if not cargo.strip():
         st.error("Describe el cargo a evaluar.")
@@ -262,11 +255,11 @@ if run:
         st.error("Sube al menos 1 PDF.")
         st.stop()
 
-    client = OpenAI(api_key=api_key_input)
+    client = OpenAI(api_key=OPENAI_API_KEY)
     set_busy(True)
 
     with st.status("Procesando CVs…", expanded=True) as status:
-        status.write("📥 Extrayendo texto…")
+        status.write("Extrayendo texto…")
         names, texts = [], []
         for f in files:
             try:
@@ -277,7 +270,7 @@ if run:
             names.append(f.name)
             texts.append(t)
 
-        status.write("🧠 Evaluando con LLM (paralelo)…")
+        status.write("Analizando perfiles…")
         progress = st.progress(0, text="Enviando solicitudes…")
 
         resultados: List[Dict[str, Any]] = []
@@ -292,7 +285,7 @@ if run:
                 progress.progress(int(done_count / len(names) * 100), text=f"Completados {done_count}/{len(names)}")
 
         progress.empty()
-        status.update(label="✅ Evaluación completa", state="complete")
+        status.update(label="Evaluación completa", state="complete")
 
     # Tabla final
     df = pd.DataFrame(resultados, columns=[
@@ -306,21 +299,20 @@ if run:
 # ==========================
 if st.session_state["evaluaciones"] is not None:
     df = st.session_state["evaluaciones"]
-    st.subheader("🏁 Resultados (según LLM — 5 niveles)")
+    st.subheader("Resultados de la evaluación")
     st.dataframe(df, use_container_width=True)
 
-    # Excel preferido
+    # Excel preferido (si openpyxl no está, ofrecer CSV)
     xlsx = df_to_excel_bytes(df, sheet_name="Resultados")
     if xlsx is not None:
-        st.markdown(b64_download_link(xlsx, "ranking_llm.xlsx", "⬇️ Descargar Excel"), unsafe_allow_html=True)
+        st.markdown(b64_download_link(xlsx, "ranking_perfiles.xlsx", "⬇️ Descargar Excel"), unsafe_allow_html=True)
     else:
-        # Fallback CSV
-        st.warning("No se encontró openpyxl. Descargando CSV (instala openpyxl para Excel).")
+        st.info("Descargando CSV.")
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.markdown(b64_download_link(csv_bytes, "ranking_llm.csv", "⬇️ Descargar CSV"), unsafe_allow_html=True)
+        st.markdown(b64_download_link(csv_bytes, "ranking_perfiles.csv", "⬇️ Descargar CSV"), unsafe_allow_html=True)
 
 # ==========================
-# Footer visual (para LinkedIn)
+# Pie de página (contacto)
 # ==========================
 st.markdown("---")
 st.markdown(
