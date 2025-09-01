@@ -5,11 +5,12 @@ Evaluador de CVs — Perfiles para un Cargo
 -----------------------------------------
 • Sube hasta 10 hojas de vida en PDF
 • Escribe el cargo y las skills requeridas
-• Obtén una tabla con: nombre, resumen corto, skills detectadas, veredicto (5 niveles) y calificación 0–100
-• Descarga el resultado en Excel (si no está disponible, se ofrece CSV)
+• Obtén una tabla con: nombre, resumen corto, skills detectadas, veredicto (5 niveles), veredicto detallado y calificación 0–100
+• Además, diagnóstico opcional de calidad del CV: estructura, redacción, calidad de experiencia y observaciones
+• Descarga del resultado en Excel (si no está disponible, se ofrece CSV)
 
-Nota: la configuración (clave de API y opciones internas) se maneja de forma segura vía Secrets/entorno.
-No se muestran controles técnicos en la interfaz pública.
+Nota: la configuración sensible (clave de API y opciones internas) se maneja de forma segura vía Secrets/entorno.
+La interfaz no muestra controles técnicos al usuario final.
 """
 from __future__ import annotations
 
@@ -129,7 +130,7 @@ if OPENAI_API_KEY:
 else:
     st.sidebar.error("Falta la clave segura para procesar CVs. (Configurar en Secrets).")
 
-# Controles de administración (solo tú los ves si SHOW_ADMIN=true en Secrets)
+# Controles de administración (solo visibles si SHOW_ADMIN=true en Secrets)
 if SHOW_ADMIN:
     CHAT_MODEL = st.sidebar.selectbox(
         "Modelo interno (solo administrador)",
@@ -176,7 +177,7 @@ if files and len(files) > MAX_PDFS_FREE:
 run = st.button("Evaluar y generar tabla", disabled=st.session_state["busy"])
 
 # ==========================
-# Prompt y evaluación
+# Prompt y evaluación (incluye diagnóstico de calidad)
 # ==========================
 def build_prompt(name: str, cargo: str, skills: List[str], context: str) -> str:
     return f"""
@@ -197,7 +198,11 @@ Devuelve SOLO un JSON con esta forma EXACTA (sin texto adicional):
   "skills_detectadas": ["skill1", "skill2", "..."],
   "veredicto": "Excelente|Muy Bueno|Regular|Débil|Muy Débil",
   "veredicto_detallado": "frase clara: ¿sirve para el puesto? ¿qué riesgos/gaps hay?",
-  "calificacion": 0-100
+  "calificacion": 0-100,
+  "estructura": "Bien organizada | Poco clara | Deficiente",
+  "redaccion": "Clara y profesional | Regular | Confusa",
+  "calidad_experiencia": "Alta | Media | Baja",
+  "observaciones": "frases cortas con puntos de mejora"
 }}
 Criterios de evaluación (rango de calificación → etiqueta):
 - Excelente (80–100): candidato ideal, cumple casi todo.
@@ -225,7 +230,7 @@ def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: L
         )
         content = resp.choices[0].message.content or ""
     except Exception as e:
-        content = f'{{"nombre":"{name}","resumen_corto":"No fue posible evaluar el CV","skills_detectadas":[],"veredicto":"Muy Débil","veredicto_detallado":"Error de evaluación","calificacion":0,"_error":"{e}"}}'
+        content = f'{{"nombre":"{name}","resumen_corto":"No fue posible evaluar el CV","skills_detectadas":[],"veredicto":"Muy Débil","veredicto_detallado":"Error de evaluación","calificacion":0,"estructura":"","redaccion":"","calidad_experiencia":"","observaciones":"","_error":"{e}"}}'
 
     data = safe_json_from_text(content)
     # Defaults / normalización
@@ -234,6 +239,10 @@ def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: L
     data.setdefault("skills_detectadas", [])
     data.setdefault("veredicto", "Muy Débil")
     data.setdefault("veredicto_detallado", "")
+    data.setdefault("estructura", "")
+    data.setdefault("redaccion", "")
+    data.setdefault("calidad_experiencia", "")
+    data.setdefault("observaciones", "")
     try:
         score = int(data.get("calificacion", 0))
     except Exception:
@@ -289,18 +298,27 @@ if run:
 
     # Tabla final
     df = pd.DataFrame(resultados, columns=[
-        "nombre", "resumen_corto", "skills_detectadas", "veredicto", "veredicto_detallado", "calificacion"
+        "nombre", "resumen_corto", "skills_detectadas",
+        "veredicto", "veredicto_detallado", "calificacion",
+        "estructura", "redaccion", "calidad_experiencia", "observaciones"
     ]).sort_values("calificacion", ascending=False).reset_index(drop=True)
     st.session_state["evaluaciones"] = df
     set_busy(False)
 
 # ==========================
-# Resultados + Descarga
+# Resultados + Descarga (con toggle para no recargar la UI)
 # ==========================
 if st.session_state["evaluaciones"] is not None:
     df = st.session_state["evaluaciones"]
     st.subheader("Resultados de la evaluación")
-    st.dataframe(df, use_container_width=True)
+
+    # Switch para mostrar/ocultar diagnóstico de calidad del CV
+    mostrar_diag = st.toggle("Mostrar diagnóstico de calidad del CV", value=False)
+    if not mostrar_diag:
+        cols_base = ["nombre", "resumen_corto", "skills_detectadas", "veredicto", "veredicto_detallado", "calificacion"]
+        st.dataframe(df[cols_base], use_container_width=True)
+    else:
+        st.dataframe(df, use_container_width=True)
 
     # Excel preferido (si openpyxl no está, ofrecer CSV)
     xlsx = df_to_excel_bytes(df, sheet_name="Resultados")
