@@ -267,8 +267,7 @@ Responde en español, con:
                 messages=[
                     {"role": "system", "content": "Eres un reclutador técnico conciso y objetivo. Respondes en español."},
                     {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
+                ]
             )
             explanation = resp.choices[0].message.content
 
