@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Evaluador de CVs — Perfiles para un Cargo
------------------------------------------
+Evaluador de CVs — Perfiles para un Cargo (con capa visual)
+-----------------------------------------------------------
 • Sube hasta 10 hojas de vida en PDF
 • Escribe el cargo y las skills requeridas
 • Obtén una tabla con: nombre, resumen corto, skills detectadas, veredicto (5 niveles), veredicto detallado y calificación 0–100
-• Además, diagnóstico opcional de calidad del CV: estructura, redacción, calidad de experiencia y observaciones
-• Descarga del resultado en Excel (si no está disponible, se ofrece CSV)
+• Diagnóstico opcional de calidad del CV: estructura, redacción, calidad de experiencia y observaciones
+• Descarga en Excel (fallback a CSV si no hay openpyxl)
+• Capa visual: colores por veredicto + barra de progreso en calificación
 
-Nota: la configuración sensible (clave de API y opciones internas) se maneja de forma segura vía Secrets/entorno.
-La interfaz no muestra controles técnicos al usuario final.
+*La configuración sensible (clave) se toma de Secrets/entorno. La interfaz no muestra controles técnicos al usuario final.*
 """
 from __future__ import annotations
 
@@ -40,8 +40,7 @@ load_dotenv()
 st.set_page_config(page_title="Evaluador de CVs — Perfiles para un Cargo", page_icon="📄", layout="wide")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# Modelo por defecto (puedes cambiarlo en secrets usando SHOW_ADMIN, no visible a usuarios)
-CHAT_MODEL_DEFAULT = "gpt-5"
+CHAT_MODEL_DEFAULT = "gpt-5"  # puedes cambiarlo en secrets con SHOW_ADMIN=true
 MAX_PDFS_FREE = 10
 SHOW_ADMIN = str(st.secrets.get("SHOW_ADMIN", "false")).lower() == "true"
 
@@ -70,9 +69,6 @@ def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or " ").strip()
 
 def windows_around_skills(text: str, skills: List[str], radius: int = 220, max_windows: int = 8) -> str:
-    """
-    Recorta el CV a ventanas alrededor de cada skill (reduce tokens y acelera).
-    """
     windows = []
     for s in skills:
         for m in re.finditer(rf"(.{{0,{radius}}}\b{s}\b.{{0,{radius}}})", text, flags=re.IGNORECASE):
@@ -103,9 +99,6 @@ def safe_json_from_text(txt: str) -> Dict[str, Any]:
     return {}
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Resultados") -> Optional[bytes]:
-    """
-    Intenta exportar Excel con openpyxl; si no está instalado, devuelve None (usaremos CSV).
-    """
     try:
         import openpyxl  # noqa: F401
         bio = io.BytesIO()
@@ -121,8 +114,59 @@ def b64_download_link(data: bytes, filename: str, label: str, mime: str = "appli
     href = f'<a href="data:{mime};base64,{b64}" download="{filename}">{label}</a>'
     return href
 
+# ========= Estilos visuales para la tabla =========
+def color_veredicto(val: str) -> str:
+    palette = {
+        "Excelente": "background-color:#2e7d32; color:white;",     # verde oscuro
+        "Muy Bueno": "background-color:#43a047; color:white;",     # verde
+        "Regular":   "background-color:#ffeb3b; color:#111;",      # amarillo
+        "Débil":     "background-color:#fb8c00; color:white;",     # naranja
+        "Muy Débil": "background-color:#e53935; color:white;",     # rojo
+    }
+    return palette.get(val, "")
+
+def barra_calificacion(val: Any) -> str:
+    try:
+        v = int(val)
+    except Exception:
+        v = 0
+    v = max(0, min(100, v))
+    # Color por umbrales
+    color = "#2e7d32" if v >= 80 else "#43a047" if v >= 61 else "#ffb300" if v >= 41 else "#fb8c00" if v >= 21 else "#e53935"
+    return f"""
+    <div style="width:110px; background:#e5e7eb; border-radius:6px; overflow:hidden;">
+      <div style="width:{v}%; background:{color}; color:white; font-size:12px; text-align:center; padding:2px 0;">
+        {v}
+      </div>
+    </div>
+    """
+
+def badges_skills(val: Any) -> str:
+    if isinstance(val, list):
+        skills = val
+    elif isinstance(val, str):
+        # por si llega como string de lista
+        skills = [s.strip() for s in re.split(r"[,\|·]", val) if s.strip()]
+    else:
+        skills = []
+    chips = "".join(
+        f'<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;">{s}</span>'
+        for s in skills[:12]
+    )
+    return f'<div style="line-height:1.9">{chips}</div>'
+
+def style_table(df: pd.DataFrame, columns_order: List[str]) -> str:
+    sty = (
+        df[columns_order]
+        .style
+        .applymap(color_veredicto, subset=["veredicto"])
+        .format({"calificacion": barra_calificacion, "skills_detectadas": badges_skills}, escape="html")
+    )
+    # to_html con escape=False para inyectar barras/badges
+    return sty.to_html(escape=False)
+
 # ==========================
-# Panel lateral (solo mensajes informativos para usuarios)
+# Panel lateral (solo info)
 # ==========================
 st.sidebar.title("Configuración")
 if OPENAI_API_KEY:
@@ -130,20 +174,19 @@ if OPENAI_API_KEY:
 else:
     st.sidebar.error("Falta la clave segura para procesar CVs. (Configurar en Secrets).")
 
-# Controles de administración (solo visibles si SHOW_ADMIN=true en Secrets)
+# Controles admin (opcionales)
 if SHOW_ADMIN:
     CHAT_MODEL = st.sidebar.selectbox(
         "Modelo interno (solo administrador)",
         options=["gpt-5", "gpt-5-mini", "gpt-5-nano"],
         index=0,
-        help="Visible solo para el administrador.",
         disabled=st.session_state["busy"]
     )
 else:
     CHAT_MODEL = CHAT_MODEL_DEFAULT
 
 # ==========================
-# Interfaz principal (no técnica)
+# Interfaz principal
 # ==========================
 st.title("📄 Evaluador de CVs — Perfiles para un Cargo")
 st.caption("Sube hojas de vida en PDF, define el cargo y recibe un ranking con análisis por perfil.")
@@ -166,7 +209,7 @@ with col_right:
 
 files = st.file_uploader(
     "📄 Sube CVs en formato PDF (máximo 10 archivos)",
-    type=["pdf"],  # restricción a PDFs
+    type=["pdf"],
     accept_multiple_files=True,
     disabled=st.session_state["busy"]
 )
@@ -177,7 +220,7 @@ if files and len(files) > MAX_PDFS_FREE:
 run = st.button("Evaluar y generar tabla", disabled=st.session_state["busy"])
 
 # ==========================
-# Prompt y evaluación (incluye diagnóstico de calidad)
+# Prompt + Evaluación
 # ==========================
 def build_prompt(name: str, cargo: str, skills: List[str], context: str) -> str:
     return f"""
@@ -204,16 +247,11 @@ Devuelve SOLO un JSON con esta forma EXACTA (sin texto adicional):
   "calidad_experiencia": "Alta | Media | Baja",
   "observaciones": "frases cortas con puntos de mejora"
 }}
-Criterios de evaluación (rango de calificación → etiqueta):
-- Excelente (80–100): candidato ideal, cumple casi todo.
-- Muy Bueno (61–80): buen ajuste, con algunos gaps.
-- Regular (41–60): encaje parcial, riesgos importantes.
-- Débil (21–40): pocos requisitos cumplidos.
-- Muy Débil (0–20): muy lejos del cargo.
+Criterios (rango → etiqueta):
+- Excelente (80–100) • Muy Bueno (61–80) • Regular (41–60) • Débil (21–40) • Muy Débil (0–20)
 """
 
 def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: List[str]) -> Dict[str, Any]:
-    # Modo rápido: recorte base + ventanas alrededor de skills
     base = text[:2500]
     skill_windows = windows_around_skills(text, skills, radius=220, max_windows=8)
     context = (base + "\n\n" + skill_windows).strip()[:7000]
@@ -226,14 +264,13 @@ def llm_evaluate_one(client: OpenAI, name: str, text: str, cargo: str, skills: L
                 {"role": "system", "content": "Responde únicamente con JSON válido. Sé conciso y objetivo."},
                 {"role": "user", "content": prompt},
             ]
-            # sin temperature/top_p
         )
         content = resp.choices[0].message.content or ""
     except Exception as e:
         content = f'{{"nombre":"{name}","resumen_corto":"No fue posible evaluar el CV","skills_detectadas":[],"veredicto":"Muy Débil","veredicto_detallado":"Error de evaluación","calificacion":0,"estructura":"","redaccion":"","calidad_experiencia":"","observaciones":"","_error":"{e}"}}'
 
     data = safe_json_from_text(content)
-    # Defaults / normalización
+    # Defaults
     data.setdefault("nombre", name)
     data.setdefault("resumen_corto", "")
     data.setdefault("skills_detectadas", [])
@@ -296,7 +333,6 @@ if run:
         progress.empty()
         status.update(label="Evaluación completa", state="complete")
 
-    # Tabla final
     df = pd.DataFrame(resultados, columns=[
         "nombre", "resumen_corto", "skills_detectadas",
         "veredicto", "veredicto_detallado", "calificacion",
@@ -306,21 +342,27 @@ if run:
     set_busy(False)
 
 # ==========================
-# Resultados + Descarga (con toggle para no recargar la UI)
+# Resultados + Descarga (con capa visual)
 # ==========================
 if st.session_state["evaluaciones"] is not None:
     df = st.session_state["evaluaciones"]
     st.subheader("Resultados de la evaluación")
 
-    # Switch para mostrar/ocultar diagnóstico de calidad del CV
     mostrar_diag = st.toggle("Mostrar diagnóstico de calidad del CV", value=False)
-    if not mostrar_diag:
-        cols_base = ["nombre", "resumen_corto", "skills_detectadas", "veredicto", "veredicto_detallado", "calificacion"]
-        st.dataframe(df[cols_base], use_container_width=True)
-    else:
-        st.dataframe(df, use_container_width=True)
 
-    # Excel preferido (si openpyxl no está, ofrecer CSV)
+    if mostrar_diag:
+        cols = ["nombre", "resumen_corto", "skills_detectadas",
+                "veredicto", "veredicto_detallado", "calificacion",
+                "estructura", "redaccion", "calidad_experiencia", "observaciones"]
+    else:
+        cols = ["nombre", "resumen_corto", "skills_detectadas",
+                "veredicto", "veredicto_detallado", "calificacion"]
+
+    # Render con estilos (colores + barra + chips)
+    html_table = style_table(df, cols)
+    st.write(html_table, unsafe_allow_html=True)
+
+    # Descarga (Excel preferido)
     xlsx = df_to_excel_bytes(df, sheet_name="Resultados")
     if xlsx is not None:
         st.markdown(b64_download_link(xlsx, "ranking_perfiles.xlsx", "⬇️ Descargar Excel"), unsafe_allow_html=True)
