@@ -195,7 +195,10 @@ col_left, col_right = st.columns([1, 1])
 with col_left:
     cargo = st.text_area(
         "Cargo / Descripción del puesto",
-        placeholder="Ejemplo: Científico/a de Datos Senior. Python, SQL, Machine Learning, arquitectura de datos, MLOps…",
+        placeholder="Ejemplo: Cargo: Científico de Datos (Colombia)
+
+Descripción del puesto:
+Buscamos un Científico de Datos con al menos 4 años de experiencia en el desarrollo, validación y despliegue de modelos de machine learning en entornos productivos.",
         height=130,
         disabled=st.session_state["busy"]
     )
